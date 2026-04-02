@@ -661,14 +661,23 @@ class AchievementPopup:
 
 class Game:
     def __init__(self):
+        os.environ.setdefault("SDL_VIDEODRIVER", "x11")
         pygame.init()
         pygame.joystick.init()
 
-        # Try fullscreen
-        try:
-            self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN)
-        except Exception:
-            self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+        # Gamescope (Steam Game Mode) handles compositing -- use NOFRAME so
+        # gamescope can scale/position the window itself.  Fall back through
+        # progressively simpler modes if something goes wrong.
+        self.screen = None
+        for flags in (pygame.NOFRAME, pygame.FULLSCREEN, 0):
+            try:
+                self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), flags)
+                break
+            except Exception:
+                continue
+        if self.screen is None:
+            print("FATAL: could not create display", file=sys.stderr)
+            sys.exit(1)
 
         pygame.display.set_caption("SIGINT Training Ops")
         self.clock = pygame.time.Clock()
@@ -960,99 +969,6 @@ class Game:
         self.screen.blit(page, (SCREEN_W // 2 - page.get_width() // 2, SCREEN_H - 80))
 
     # ── Playing ────────────────────────────────────────────────────────────
-
-    def update_playing(self, events):
-        if self.back_pressed(events):
-            self.state = "menu"
-            return
-
-        if self.level_complete or self.level_failed:
-            return
-
-        keys = pygame.key.get_pressed()
-        joy_x = self.get_joy_axis(0)
-
-        # Horizontal movement
-        dx = 0
-        if keys[pygame.K_LEFT] or keys[pygame.K_a] or joy_x < -0.3:
-            dx = -PLAYER_SPEED
-            self.player.facing_right = False
-        if keys[pygame.K_RIGHT] or keys[pygame.K_d] or joy_x > 0.3:
-            dx = PLAYER_SPEED
-            self.player.facing_right = True
-
-        self.player.x += dx
-
-        # Jump
-        jump = False
-        for ev in events:
-            if ev.type == pygame.KEYDOWN and ev.key in (pygame.K_SPACE, pygame.K_UP, pygame.K_w):
-                jump = True
-            if ev.type == pygame.JOYBUTTONDOWN and ev.button == 0:  # A button
-                jump = True
-        if jump and self.player.on_ground:
-            self.player.vy = JUMP_FORCE
-
-        self.player.update(self.platforms)
-
-        # Scroll camera
-        target_scroll = self.player.x - SCREEN_W // 3
-        self.scroll_x += (target_scroll - self.scroll_x) * 0.1
-        self.scroll_x = max(0, min(self.scroll_x, self.current_level["length"] - SCREEN_W + 200))
-
-        # Update pickups
-        for p in self.pickups:
-            if p.collected:
-                continue
-            p.update(self.frame)
-            pr = p.rect(self.scroll_x)
-            player_screen_rect = pygame.Rect(
-                self.player.x - self.scroll_x, self.player.y, self.player.w, self.player.h
-            )
-            if player_screen_rect.colliderect(pr):
-                p.collected = True
-                self.player.score += 100
-                self.player.pickups_collected += 1
-                # Particles
-                for _ in range(12):
-                    self.particles.append(Particle(
-                        p.x - self.scroll_x, p.bob_y, self.current_level["color"],
-                        random.uniform(-3, 3), random.uniform(-4, 1), 25, 4
-                    ))
-
-        # Update enemies
-        for e in self.enemies:
-            if not e.alive:
-                continue
-            e.update(self.frame)
-            er = e.rect(self.scroll_x)
-            player_screen_rect = pygame.Rect(
-                self.player.x - self.scroll_x, self.player.y, self.player.w, self.player.h
-            )
-            if player_screen_rect.colliderect(er):
-                if self.player.flash_timer == 0:
-                    self.player.hp -= 15
-                    self.player.flash_timer = 30
-                    for _ in range(8):
-                        self.particles.append(Particle(
-                            self.player.x - self.scroll_x + 16,
-                            self.player.y + 24, RED,
-                            random.uniform(-3, 3), random.uniform(-3, 1), 20, 3
-                        ))
-
-        # Particles
-        for p in self.particles:
-            p.update()
-        self.particles = [p for p in self.particles if p.life > 0]
-
-        # Check win condition -- reach end
-        if self.player.x > self.current_level["length"]:
-            self.level_complete = True
-            self.on_level_complete()
-
-        # Check fail
-        if self.player.hp <= 0:
-            self.level_failed = True
 
     def draw_playing(self):
         level = self.current_level
