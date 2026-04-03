@@ -12,6 +12,14 @@ import random
 import json
 import os
 import time
+import struct
+import array as _array
+
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -42,6 +50,354 @@ ACCENT_RED = (255, 80, 80)
 ACCENT_YELLOW = (255, 200, 60)
 
 SAVE_FILE = os.path.expanduser("~/.sigint_game_save.json")
+SAMPLE_RATE = 44100
+
+# ── Procedural Audio Engine ────────────────────────────────────────────────────
+# All sounds match the real SIGINT-Pi/Deck alerting system:
+#   Backend: src/alerts/sound.rs  (SoundEffect enum, play_system_beep frequencies)
+#   Browser: static/index.html    (playAlertTone WebAudio tones)
+#
+# Priority → Frequency mapping (from sound.rs play_system_beep):
+#   Critical/Attack (90-100) → 880 Hz, 300ms
+#   Tracker/Geofence (70-89) → 660 Hz, 200ms
+#   Medium/NewDevice (50-69) → 440 Hz, 100ms
+#   Low/System       (<50)   → 330 Hz, 100ms
+#
+# Browser playAlertTone (from index.html):
+#   drone:   square wave 660→880→660 Hz
+#   tracker: triangle wave 440→550→440 Hz
+#   default: sine 523 Hz
+
+class AudioEngine:
+    """Procedural audio matching SIGINT-Pi/Deck alert system. No files needed."""
+
+    def __init__(self):
+        try:
+            pygame.mixer.pre_init(SAMPLE_RATE, -16, 2, 512)
+            pygame.mixer.init()
+            self.enabled = True
+        except Exception:
+            self.enabled = False
+            return
+
+        self.sfx = {}
+        self.music_playing = False
+        self.bar_pos = 0
+        self._generate_sfx()
+        self._generate_music_loops()
+
+    # ── Waveform primitives ────────────────────────────────────────────
+
+    def _make_sound(self, samples_float, volume=1.0):
+        """Convert float [-1,1] mono array to stereo pygame Sound."""
+        if HAS_NUMPY:
+            s = np.clip(samples_float, -1, 1)
+            s = (s * volume * 32767).astype(np.int16)
+            return pygame.sndarray.make_sound(np.column_stack((s, s)))
+        # fallback: already a Sound
+        return samples_float
+
+    def _sine(self, freq, duration, volume=0.3):
+        n = int(SAMPLE_RATE * duration)
+        if HAS_NUMPY:
+            t = np.linspace(0, duration, n, endpoint=False)
+            return self._make_sound(np.sin(2 * np.pi * freq * t), volume)
+        buf = _array.array("h")
+        for i in range(n):
+            v = int(math.sin(2 * math.pi * freq * i / SAMPLE_RATE) * volume * 32767)
+            buf.append(v); buf.append(v)
+        return pygame.mixer.Sound(buffer=buf)
+
+    def _square(self, freq, duration, volume=0.2):
+        n = int(SAMPLE_RATE * duration)
+        if HAS_NUMPY:
+            t = np.linspace(0, duration, n, endpoint=False)
+            return self._make_sound(np.sign(np.sin(2 * np.pi * freq * t)), volume)
+        return self._sine(freq, duration, volume)
+
+    def _triangle(self, freq, duration, volume=0.25):
+        n = int(SAMPLE_RATE * duration)
+        if HAS_NUMPY:
+            t = np.linspace(0, duration, n, endpoint=False)
+            phase = (t * freq) % 1.0
+            wave = 2 * np.abs(2 * phase - 1) - 1
+            return self._make_sound(wave, volume)
+        return self._sine(freq, duration, volume)
+
+    def _saw(self, freq, duration, volume=0.2):
+        n = int(SAMPLE_RATE * duration)
+        if HAS_NUMPY:
+            t = np.linspace(0, duration, n, endpoint=False)
+            wave = ((t * freq) % 1.0) * 2 - 1
+            env = np.linspace(1, 0, n) ** 0.5
+            return self._make_sound(wave * env, volume)
+        return self._sine(freq, duration, volume)
+
+    def _noise(self, duration, volume=0.15):
+        n = int(SAMPLE_RATE * duration)
+        if HAS_NUMPY:
+            raw = np.random.uniform(-1, 1, n)
+            env = np.linspace(1, 0, n) ** 2
+            return self._make_sound(raw * env, volume)
+        buf = _array.array("h")
+        for i in range(n):
+            v = int(random.uniform(-1, 1) * volume * 32767 * (1 - i / n) ** 2)
+            buf.append(v); buf.append(v)
+        return pygame.mixer.Sound(buffer=buf)
+
+    def _sweep_tone(self, f_start, f_end, duration, waveform="sine", volume=0.3):
+        """Frequency sweep (used for drone alerts, kicks)."""
+        n = int(SAMPLE_RATE * duration)
+        if HAS_NUMPY:
+            t = np.linspace(0, duration, n, endpoint=False)
+            freq = np.linspace(f_start, f_end, n)
+            phase = np.cumsum(freq / SAMPLE_RATE) * 2 * np.pi
+            if waveform == "square":
+                wave = np.sign(np.sin(phase))
+            else:
+                wave = np.sin(phase)
+            env = np.exp(-t * (3 / duration))
+            return self._make_sound(wave * env, volume)
+        return self._sine((f_start + f_end) / 2, duration, volume)
+
+    def _multi_tone(self, segments, waveform="sine", volume=0.3):
+        """Build a sound from [(freq, duration), ...] segments.
+        Matches the browser playAlertTone pattern."""
+        if not HAS_NUMPY:
+            f = segments[0][0] if segments else 440
+            d = sum(s[1] for s in segments)
+            return self._sine(f, d, volume)
+        parts = []
+        for freq, dur in segments:
+            n = int(SAMPLE_RATE * dur)
+            t = np.linspace(0, dur, n, endpoint=False)
+            if waveform == "square":
+                w = np.sign(np.sin(2 * np.pi * freq * t))
+            elif waveform == "triangle":
+                phase = (t * freq) % 1.0
+                w = 2 * np.abs(2 * phase - 1) - 1
+            else:
+                w = np.sin(2 * np.pi * freq * t)
+            parts.append(w)
+        wave = np.concatenate(parts)
+        total_n = len(wave)
+        # Exponential decay envelope matching browser gain.exponentialRampToValueAtTime
+        env = np.exp(-np.linspace(0, 4, total_n))
+        return self._make_sound(wave * env, volume)
+
+    # ── SIGINT-matched SFX ─────────────────────────────────────────────
+
+    def _generate_sfx(self):
+        if not self.enabled:
+            return
+
+        # -- NewDevice (prio 50): 440 Hz sine, 100ms
+        #    → Game: pickup collect
+        self.sfx["pickup"] = self._sine(440, 0.1, 0.35)
+
+        # -- TrackerDetected (prio 90): 880 Hz, 300ms backend
+        #    Browser: triangle 440→550→440 Hz
+        #    → Game: enemy nearby warning
+        self.sfx["tracker"] = self._multi_tone(
+            [(440, 0.15), (550, 0.15), (440, 0.15)], "triangle", 0.3
+        )
+
+        # -- AttackDetected (prio 100): 880 Hz, 300ms
+        #    → Game: taking damage
+        self.sfx["hit"] = self._sine(880, 0.3, 0.35)
+
+        # -- DroneDetected: square 660→880→660 (browser playAlertTone)
+        #    → Game: drone level enemies
+        self.sfx["drone_alert"] = self._multi_tone(
+            [(660, 0.2), (880, 0.2), (660, 0.2)], "square", 0.3
+        )
+
+        # -- CriticalAlert (prio 100): 880 Hz, 300ms rapid pulse
+        #    → Game: level fail
+        self.sfx["critical"] = self._build_critical()
+
+        # -- HighAlert (prio 80): 660 Hz, 200ms
+        #    → Game: HP low warning
+        self.sfx["high_alert"] = self._sine(660, 0.2, 0.3)
+
+        # -- MediumAlert (prio 60): 440 Hz, 100ms
+        #    → Game: tutorial page advance
+        self.sfx["medium_alert"] = self._sine(440, 0.1, 0.2)
+
+        # -- LowAlert (prio 40): 330 Hz, 100ms
+        #    → Game: menu navigation
+        self.sfx["low_alert"] = self._sine(330, 0.1, 0.15)
+
+        # -- GeofenceEnter (prio 70): 660 Hz, 200ms
+        #    → Game: level start / entering zone
+        self.sfx["geofence_enter"] = self._sine(660, 0.2, 0.25)
+
+        # -- GeofenceExit (prio 70): 660 Hz descending
+        #    → Game: level complete
+        self.sfx["geofence_exit"] = self._build_level_complete()
+
+        # -- SystemReady (prio 30): 330 Hz, 100ms
+        #    → Game: boot/ready chime
+        self.sfx["system_ready"] = self._build_ready_chime()
+
+        # -- SystemError (prio 30): 330 Hz low
+        #    → Game: error state
+        self.sfx["system_error"] = self._sine(330, 0.3, 0.3)
+
+        # -- Achievement unlock (ascending arp from alert frequencies)
+        self.sfx["achievement"] = self._build_achievement()
+
+        # -- Jump (short chirp, not a real SIGINT sound)
+        self.sfx["jump"] = self._sweep_tone(330, 660, 0.08, "sine", 0.15)
+
+        # -- Sentinel mode radar ping
+        self.sfx["radar_ping"] = self._sweep_tone(1200, 2400, 0.15, "sine", 0.1)
+
+        # Aliases for easy use
+        self.sfx["menu_move"] = self.sfx["low_alert"]
+        self.sfx["menu_confirm"] = self.sfx["geofence_enter"]
+        self.sfx["page"] = self.sfx["medium_alert"]
+        self.sfx["fail"] = self.sfx["critical"]
+        self.sfx["level_complete"] = self.sfx["geofence_exit"]
+
+    def _build_critical(self):
+        """CriticalAlert: triple 880 Hz pulse (matching backend 880Hz/300ms)."""
+        if not HAS_NUMPY:
+            return self._sine(880, 0.5, 0.35)
+        parts = []
+        for _ in range(3):
+            n_on = int(SAMPLE_RATE * 0.1)
+            n_off = int(SAMPLE_RATE * 0.05)
+            t = np.linspace(0, 0.1, n_on, endpoint=False)
+            parts.append(np.sin(2 * np.pi * 880 * t))
+            parts.append(np.zeros(n_off))
+        wave = np.concatenate(parts)
+        return self._make_sound(wave, 0.35)
+
+    def _build_level_complete(self):
+        """GeofenceExit → level complete: ascending chord 330→440→660→880."""
+        if not HAS_NUMPY:
+            return self._sine(660, 0.6, 0.25)
+        freqs = [330, 440, 660, 880]
+        total_n = int(SAMPLE_RATE * 0.8)
+        wave = np.zeros(total_n)
+        for i, f in enumerate(freqs):
+            start = int(i * SAMPLE_RATE * 0.15)
+            dur = int(SAMPLE_RATE * 0.4)
+            end = min(start + dur, total_n)
+            t = np.arange(end - start) / SAMPLE_RATE
+            wave[start:end] += np.sin(2 * np.pi * f * t) * np.exp(-t * 3) * 0.2
+        return self._make_sound(np.clip(wave, -1, 1), 0.3)
+
+    def _build_ready_chime(self):
+        """SystemReady: two-tone 330→440 chime."""
+        if not HAS_NUMPY:
+            return self._sine(330, 0.2, 0.2)
+        n1 = int(SAMPLE_RATE * 0.15)
+        n2 = int(SAMPLE_RATE * 0.2)
+        t1 = np.arange(n1) / SAMPLE_RATE
+        t2 = np.arange(n2) / SAMPLE_RATE
+        w1 = np.sin(2 * np.pi * 330 * t1) * np.exp(-t1 * 8)
+        w2 = np.sin(2 * np.pi * 440 * t2) * np.exp(-t2 * 6)
+        return self._make_sound(np.concatenate([w1, w2]), 0.25)
+
+    def _build_achievement(self):
+        """Achievement: ascending through the SIGINT priority frequencies."""
+        if not HAS_NUMPY:
+            return self._sine(880, 0.6, 0.25)
+        # Walk up the alert priority ladder: 330 → 440 → 660 → 880 → 1320
+        freqs = [330, 440, 660, 880, 1320]
+        total_n = int(SAMPLE_RATE * 1.0)
+        wave = np.zeros(total_n)
+        for i, f in enumerate(freqs):
+            start = int(i * SAMPLE_RATE * 0.12)
+            dur = int(SAMPLE_RATE * 0.5)
+            end = min(start + dur, total_n)
+            t = np.arange(end - start) / SAMPLE_RATE
+            wave[start:end] += np.sin(2 * np.pi * f * t) * np.exp(-t * 2) * 0.15
+        return self._make_sound(np.clip(wave, -1, 1), 0.3)
+
+    # ── Techno music loops (procedural) ────────────────────────────────
+
+    def _generate_music_loops(self):
+        if not self.enabled:
+            return
+        # Kick drum: pitch-swept sine (150→40 Hz)
+        self.kick_sound = self._sweep_tone(150, 40, 0.25, "sine", 0.45)
+        # Hi-hat: short noise burst
+        self.hihat_sound = self._noise(0.04, 0.06)
+        # Snare: noise + 200 Hz tone burst
+        self.snare_sound = self._build_snare()
+        # Acid bassline in A minor
+        bass_freqs = [55, 55, 65.4, 73.4, 55, 82.4, 73.4, 65.4]
+        self.bass_notes = [self._saw(f, 0.18, 0.2) for f in bass_freqs]
+        # Arp: minor pentatonic using FM synthesis
+        arp_freqs = [220, 261, 330, 392, 440, 523, 660, 784]
+        self.arp_notes = []
+        for f in arp_freqs:
+            if HAS_NUMPY:
+                n = int(SAMPLE_RATE * 0.1)
+                t = np.linspace(0, 0.1, n, endpoint=False)
+                mod = np.sin(2 * np.pi * (f * 0.5) * t) * 2.0
+                wave = np.sin(2 * np.pi * f * t + mod) * np.exp(-t * 15)
+                self.arp_notes.append(self._make_sound(wave, 0.08))
+            else:
+                self.arp_notes.append(self._sine(f, 0.1, 0.08))
+        # Pad drone
+        self.pad_sound = self._sine(110, 2.0, 0.06)
+
+    def _build_snare(self):
+        if not HAS_NUMPY:
+            return self._noise(0.1, 0.18)
+        n = int(SAMPLE_RATE * 0.12)
+        t = np.linspace(0, 0.12, n, endpoint=False)
+        tone = np.sin(2 * np.pi * 200 * t) * np.exp(-t * 40)
+        noise = np.random.uniform(-1, 1, n) * np.exp(-t * 20)
+        return self._make_sound(tone * 0.5 + noise * 0.5, 0.18)
+
+    # ── Playback ───────────────────────────────────────────────────────
+
+    def play(self, name):
+        if not self.enabled:
+            return
+        snd = self.sfx.get(name)
+        if snd:
+            snd.play()
+
+    def tick_music(self, frame):
+        """Call every frame to drive the 138 BPM sequencer."""
+        if not self.enabled or not self.music_playing:
+            return
+        step_frames = max(1, int(60 * 60 / (138 * 4)))
+        if frame % step_frames != 0:
+            return
+
+        step = self.bar_pos % 16
+        bar = (self.bar_pos // 16) % 4
+
+        if step % 4 == 0:
+            self.kick_sound.play()
+        if step % 2 == 0:
+            self.hihat_sound.play()
+        if step in (4, 12):
+            self.snare_sound.play()
+        if step % 4 == 0:
+            bass_idx = (step // 4 + bar * 4) % len(self.bass_notes)
+            self.bass_notes[bass_idx].play()
+        if bar in (1, 3) and step % 2 == 0:
+            arp_idx = (step // 2 + bar) % len(self.arp_notes)
+            self.arp_notes[arp_idx].play()
+        if step == 0 and bar % 2 == 0:
+            self.pad_sound.play()
+        self.bar_pos += 1
+
+    def start_music(self):
+        self.music_playing = True
+        self.bar_pos = 0
+
+    def stop_music(self):
+        self.music_playing = False
+
 
 # ── Achievement Definitions ────────────────────────────────────────────────────
 
@@ -680,6 +1036,7 @@ class Game:
             sys.exit(1)
 
         pygame.display.set_caption("SIGINT Training Ops")
+        self.audio = AudioEngine()
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 28)
         self.big_font = pygame.font.Font(None, 48)
@@ -712,6 +1069,9 @@ class Game:
         # Menu animation
         self.menu_scroll = 0
         self.credits_scroll_y = SCREEN_H
+
+        # Boot chime
+        self.audio.play("system_ready")
 
     def run(self):
         while True:
@@ -746,6 +1106,9 @@ class Game:
             elif self.state == "credits":
                 self.update_credits(events)
                 self.draw_credits()
+
+            # Music sequencer
+            self.audio.tick_music(self.frame)
 
             # Popups
             for p in self.popups:
@@ -820,10 +1183,13 @@ class Game:
         menu_count = len(LEVELS) + 2
         if self.up_pressed(events):
             self.selected_level = (self.selected_level - 1) % menu_count
+            self.audio.play("menu_move")
         if self.down_pressed(events):
             self.selected_level = (self.selected_level + 1) % menu_count
+            self.audio.play("menu_move")
 
         if self.action_pressed(events):
+            self.audio.play("menu_confirm")
             if self.selected_level == len(LEVELS):
                 self.state = "achievements"
             elif self.selected_level == len(LEVELS) + 1:
@@ -927,8 +1293,11 @@ class Game:
     def update_tutorial(self, events):
         if self.action_pressed(events):
             self.tutorial_page += 1
+            self.audio.play("page")
             if self.tutorial_page >= len(self.current_level["tutorial"]):
                 self.tutorial_done = True
+                self.audio.play("geofence_enter")
+                self.audio.start_music()
                 self.state = "playing"
 
         if self.back_pressed(events):
@@ -1059,6 +1428,7 @@ class Game:
             unlocked.append(ach_id)
             self.save_data["unlocked"] = unlocked
             self.popups.append(AchievementPopup(ACHIEVEMENTS[ach_id]))
+            self.audio.play("achievement")
 
         # Check full operator
         all_done = all(l["id"] in completed for l in LEVELS)
@@ -1066,6 +1436,7 @@ class Game:
             unlocked.append("full_operator")
             self.save_data["unlocked"] = unlocked
             self.popups.append(AchievementPopup(ACHIEVEMENTS["full_operator"]))
+            self.audio.play("achievement")
 
         save_game(self.save_data)
 
@@ -1078,6 +1449,7 @@ class Game:
 
     def update_playing(self, events):
         if self.back_pressed(events):
+            self.audio.stop_music()
             self.state = "menu"
             return
 
@@ -1114,6 +1486,7 @@ class Game:
                 jump = True
         if jump and self.player.on_ground:
             self.player.vy = JUMP_FORCE
+            self.audio.play("jump")
 
         self.player.update(self.platforms)
 
@@ -1133,6 +1506,7 @@ class Game:
                 p.collected = True
                 self.player.score += 100
                 self.player.pickups_collected += 1
+                self.audio.play("pickup")
                 for _ in range(12):
                     self.particles.append(Particle(
                         p.x - self.scroll_x, p.bob_y, self.current_level["color"],
@@ -1151,6 +1525,15 @@ class Game:
                 if self.player.flash_timer == 0:
                     self.player.hp -= 15
                     self.player.flash_timer = 30
+                    # Play the matching SIGINT alert for this enemy type
+                    if e.etype == "drone":
+                        self.audio.play("drone_alert")
+                    elif e.etype in ("spoof", "threat"):
+                        self.audio.play("tracker")
+                    else:
+                        self.audio.play("hit")
+                    if self.player.hp <= 25 and self.player.hp > 0:
+                        self.audio.play("high_alert")
                     for _ in range(8):
                         self.particles.append(Particle(
                             self.player.x - self.scroll_x + 16,
@@ -1164,10 +1547,14 @@ class Game:
 
         if self.player.x > self.current_level["length"]:
             self.level_complete = True
+            self.audio.stop_music()
+            self.audio.play("level_complete")
             self.on_level_complete()
 
         if self.player.hp <= 0:
             self.level_failed = True
+            self.audio.stop_music()
+            self.audio.play("critical")
 
     # ── Achievements Screen ────────────────────────────────────────────────
 
