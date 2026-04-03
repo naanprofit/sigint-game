@@ -1,0 +1,6 @@
+SHORT DESCRIPTION (paste into GitHub repo Settings > General > Description):
+
+SIGINT Training Ops -- Side-scroller game teaching RF SIGINT concepts through gameplay. 9 levels covering WiFi, BLE, SDR, drone detection, Sentinel Mode, SIEM, antenna arrays, KrakenSDR DF, Flipper Zero. Procedural techno soundtrack matching real SIGINT alert tones. Steam Deck controller support, fullscreen, achievements. One-command installer.
+
+TOPICS (paste as comma-separated tags):
+sigint, pygame, steam-deck, training, game, side-scroller, sdr, cybersecurity, education, rf-analysis, drone-detection, achievements
