@@ -1068,7 +1068,9 @@ class Game:
 
         # Menu animation
         self.menu_scroll = 0
-        self.credits_scroll_y = SCREEN_H
+        self.credits_scroll_y = float(SCREEN_H)
+        self._credits_surface = pygame.Surface((SCREEN_W, SCREEN_H))
+        self._credits_total_h = SCREEN_H
 
         # Boot chime
         self.audio.play("system_ready")
@@ -1193,7 +1195,9 @@ class Game:
             if self.selected_level == len(LEVELS):
                 self.state = "achievements"
             elif self.selected_level == len(LEVELS) + 1:
-                self.credits_scroll_y = SCREEN_H
+                self.credits_scroll_y = float(SCREEN_H)
+                self._build_credits_surface()
+                self.audio.start_music()
                 self.state = "credits"
             else:
                 self.start_level(self.selected_level)
@@ -1812,76 +1816,103 @@ class Game:
         ("blank", ""),
     ]
 
-    def update_credits(self, events):
-        if self.back_pressed(events) or self.action_pressed(events):
-            self.state = "menu"
-            return
-
-        # Auto-scroll
-        self.credits_scroll_y -= 1.0
-
-        # D-pad/keys to scroll faster
-        keys = pygame.key.get_pressed()
-        joy_y = self.get_joy_axis(1)
-        if keys[pygame.K_UP] or keys[pygame.K_w] or joy_y < -0.3:
-            self.credits_scroll_y -= 4
-        if keys[pygame.K_DOWN] or keys[pygame.K_s] or joy_y > 0.3:
-            self.credits_scroll_y += 4
-
-        total_h = len(self.CREDITS_DATA) * 32 + 200
-        if self.credits_scroll_y < -total_h:
-            self.credits_scroll_y = SCREEN_H
-
-    def draw_credits(self):
-        self.screen.fill(DARK_BG)
-        draw_bg_grid(self.screen, self.frame * 0.2, self.frame)
-
-        y = self.credits_scroll_y
+    def _build_credits_surface(self):
+        """Pre-render entire credits to one surface for smooth scrolling."""
         cx = SCREEN_W // 2
+        # First pass: measure total height
+        y = 0
+        for entry_type, _ in self.CREDITS_DATA:
+            if entry_type == "title": y += 64
+            elif entry_type == "heading": y += 48
+            elif entry_type == "subheading": y += 30
+            elif entry_type == "text": y += 26
+            elif entry_type == "link": y += 22
+            elif entry_type == "divider": y += 20
+            elif entry_type == "blank": y += 18
+        total_h = y + SCREEN_H  # extra padding so it scrolls fully off
 
+        surf = pygame.Surface((SCREEN_W, total_h))
+        surf.fill(DARK_BG)
+
+        # Second pass: render
+        y = 0
         for entry_type, text in self.CREDITS_DATA:
-            if y > SCREEN_H + 40:
-                y += 32
-                continue
-            if y < -40:
-                y += 32
-                continue
-
             if entry_type == "title":
-                rendered = self.title_font.render(text, True, ACCENT_GREEN)
-                self.screen.blit(rendered, (cx - rendered.get_width() // 2, y))
+                r = self.title_font.render(text, True, ACCENT_GREEN)
+                surf.blit(r, (cx - r.get_width() // 2, y))
                 y += 64
             elif entry_type == "heading":
-                rendered = self.big_font.render(text, True, WHITE)
-                self.screen.blit(rendered, (cx - rendered.get_width() // 2, y))
+                r = self.big_font.render(text, True, WHITE)
+                surf.blit(r, (cx - r.get_width() // 2, y))
                 y += 48
             elif entry_type == "subheading":
-                rendered = self.font.render(text, True, ACCENT_BLUE)
-                self.screen.blit(rendered, (cx - rendered.get_width() // 2, y))
+                r = self.font.render(text, True, ACCENT_BLUE)
+                surf.blit(r, (cx - r.get_width() // 2, y))
                 y += 30
             elif entry_type == "text":
-                rendered = self.font.render(text, True, (190, 195, 210))
-                self.screen.blit(rendered, (cx - rendered.get_width() // 2, y))
+                r = self.font.render(text, True, (190, 195, 210))
+                surf.blit(r, (cx - r.get_width() // 2, y))
                 y += 26
             elif entry_type == "link":
-                rendered = self.small_font.render(text, True, (80, 160, 200))
-                self.screen.blit(rendered, (cx - rendered.get_width() // 2, y))
+                r = self.small_font.render(text, True, (80, 160, 200))
+                surf.blit(r, (cx - r.get_width() // 2, y))
                 y += 22
             elif entry_type == "divider":
-                pygame.draw.line(self.screen, (40, 50, 65),
+                pygame.draw.line(surf, (40, 50, 65),
                                  (cx - 200, y + 8), (cx + 200, y + 8), 1)
                 y += 20
             elif entry_type == "blank":
                 y += 18
 
-        # Fixed hint at bottom
+        self._credits_surface = surf
+        self._credits_total_h = total_h
+
+    def update_credits(self, events):
+        if self.back_pressed(events) or self.action_pressed(events):
+            self.audio.stop_music()
+            self.state = "menu"
+            return
+
+        # Smooth sub-pixel scrolling via float accumulator
+        self.credits_scroll_y -= 0.8
+
+        keys = pygame.key.get_pressed()
+        joy_y = self.get_joy_axis(1)
+        if keys[pygame.K_UP] or keys[pygame.K_w] or joy_y < -0.3:
+            self.credits_scroll_y -= 3.0
+        if keys[pygame.K_DOWN] or keys[pygame.K_s] or joy_y > 0.3:
+            self.credits_scroll_y += 3.0
+
+        # Wrap when scrolled past everything
+        if self.credits_scroll_y < -self._credits_total_h:
+            self.credits_scroll_y = float(SCREEN_H)
+
+    def draw_credits(self):
+        self.screen.fill(DARK_BG)
+
+        # Subtle animated background grid (slow)
+        draw_bg_grid(self.screen, self.frame * 0.15, self.frame)
+
+        # Blit pre-rendered credits surface at integer offset for clean pixels
+        iy = int(self.credits_scroll_y)
+        self.screen.blit(self._credits_surface, (0, iy))
+
+        # Top/bottom fade gradients for polish
+        for i in range(60):
+            alpha = 255 - int(255 * (i / 60))
+            fade = pygame.Surface((SCREEN_W, 1), pygame.SRCALPHA)
+            fade.fill((12, 14, 20, alpha))
+            self.screen.blit(fade, (0, i))
+            self.screen.blit(fade, (0, SCREEN_H - 41 - i))
+
+        # Fixed hint bar at bottom
         hint_bg = pygame.Surface((SCREEN_W, 40), pygame.SRCALPHA)
-        hint_bg.fill((12, 14, 20, 220))
+        hint_bg.fill((12, 14, 20, 230))
         self.screen.blit(hint_bg, (0, SCREEN_H - 40))
         hint = self.small_font.render(
             "D-Pad/Arrows: Scroll  |  B/Esc/Enter: Back to Menu", True, (80, 90, 110)
         )
-        self.screen.blit(hint, (cx - hint.get_width() // 2, SCREEN_H - 30))
+        self.screen.blit(hint, (SCREEN_W // 2 - hint.get_width() // 2, SCREEN_H - 30))
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
